@@ -558,9 +558,19 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     _tie = getattr(model.config, "tie_word_embeddings", False)
     _wrap_by_name = set() if _tie else {"embed_tokens", "lm_head"}
 
+    # A peft-wrapped lm_head (LoRA on the unembedding, e.g. SecOPD) is a `peft.tuners.lora.layer.Linear`;
+    # `fully_shard` on it fails with "__class__ assignment: 'FSDPLinear' object layout differs from 'Linear'"
+    # under the ABC patch, whereas sharding it as part of the root module works. Skip tuner layers here.
+    try:
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except Exception:  # peft not installed
+        BaseTunerLayer = ()
+
     modules = []
     for name, module in model.named_modules():
         leaf_name = name.rsplit(".", 1)[-1] if "." in name else name
+        if BaseTunerLayer and isinstance(module, BaseTunerLayer):
+            continue
         if (
             module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap
             or (isinstance(module, nn.Embedding) and not _tie)

@@ -478,6 +478,45 @@ def register(agent_name: str):
     return decorator
 
 
+def relayout_teacher_outputs(
+    teacher_ids: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    *,
+    teacher_prompt_len: int,
+    prompt_ids: list[int],
+    response_ids: list[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-lay teacher outputs computed on ``teacher_prompt + response`` onto ``prompt + response``.
+
+    Teacher arrays follow the rollout server's *prediction-position* layout (see
+    ``extract_prompt_logprobs``): row ``i`` holds the id / logprob of token ``i + 1`` given tokens ``<= i``,
+    and the last row is a dummy.  For a sequence ``p || z`` with ``|p| = P`` the response tokens
+    ``z_j = seq[P + j]`` therefore live in rows ``[P - 1, P - 1 + R)``, which is exactly the slice
+    ``no_padding_2_padding`` takes for the student log-probs.  We move rows ``[P_c - 1, P_c - 1 + R)`` of the
+    teacher-prompt sequence to rows ``[P - 1, P - 1 + R)`` of the student layout; prompt rows get the
+    (shifted) student prompt ids with logprob 0 (they are masked out of every loss), and the trailing dummy
+    row is kept.
+    """
+    P, R, Pc = len(prompt_ids), len(response_ids), teacher_prompt_len
+    assert P > 0 and Pc > 0, (P, Pc)
+    assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == Pc + R, (teacher_ids.shape, teacher_logprobs.shape, Pc, R)
+    resp_ids_t = teacher_ids[Pc - 1 : Pc - 1 + R]
+    resp_lps_t = teacher_logprobs[Pc - 1 : Pc - 1 + R]
+    if R > 0:
+        # consistency: the teacher's shifted ids over the response rows must be the response tokens themselves
+        got = resp_ids_t[:, 0].tolist() if resp_ids_t.dim() == 2 else resp_ids_t.tolist()
+        if got != [int(t) for t in response_ids]:
+            raise ValueError("teacher prompt_ids over the response rows do not match the response tokens")
+    K = teacher_ids.shape[1:]  # (1,) or (topk,)
+    prompt_rows = torch.tensor([int(t) for t in prompt_ids[1:]] + [0], dtype=teacher_ids.dtype).view(P, *([1] * len(K)))
+    prompt_rows = prompt_rows.expand(P, *K).clone()
+    new_ids = torch.cat([prompt_rows[: P - 1], resp_ids_t, prompt_rows[P - 1 :]], dim=0)
+    zeros_lp = torch.zeros((P,) + tuple(teacher_logprobs.shape[1:]), dtype=teacher_logprobs.dtype)
+    new_lps = torch.cat([zeros_lp[: P - 1], resp_lps_t, zeros_lp[P - 1 :]], dim=0)
+    assert new_ids.shape[0] == new_lps.shape[0] == P + R
+    return new_ids, new_lps
+
+
 class AgentLoopWorker:
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
@@ -1044,13 +1083,33 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
-            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
-                multi_modal_data=output.multi_modal_data,
-                mm_processor_kwargs=output.mm_processor_kwargs,
-                mm_processor_output=getattr(output, "mm_processor_output", None),
-                routing_key=routing_key,
-            )
+            # SecOPD (cross-context scoring): when the agent loop supplies `teacher_prompt_ids`, the teacher
+            # scores the student's response under that *paired* prompt (e.g. the clean, un-injected
+            # prompt) instead of the student's own prompt:  h_t^c = p_c || z_<t.  The per-token teacher
+            # logprobs are then re-laid onto the student's [prompt | response] layout so the downstream
+            # k1 estimator compares log pi_theta(z_t | p_a, z_<t) with log pi_ref(z_t | p_c, z_<t).
+            teacher_prompt_ids = output.extra_fields.pop("teacher_prompt_ids", None)
+            if teacher_prompt_ids is not None:
+                teacher_prompt_ids = [int(t) for t in teacher_prompt_ids]
+                t_ids, t_lps = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    sequence_ids=teacher_prompt_ids + response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    mm_processor_output=getattr(output, "mm_processor_output", None),
+                    routing_key=routing_key,
+                )
+                teacher_ids, teacher_logprobs = relayout_teacher_outputs(
+                    t_ids, t_lps, teacher_prompt_len=len(teacher_prompt_ids),
+                    prompt_ids=prompt_ids, response_ids=response_ids,
+                )
+            else:
+                teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+                    sequence_ids=prompt_ids + response_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                    mm_processor_output=getattr(output, "mm_processor_output", None),
+                    routing_key=routing_key,
+                )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

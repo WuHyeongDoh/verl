@@ -497,6 +497,14 @@ class ReplayBuffer:
             if not self.sync_refill_failed_groups:
                 message += " Enable trainer.v1.sampler.sync_refill_failed_groups to replace failed groups."
             raise RuntimeError(message)
+        # SecOPD (patch 0004): partially failed batches are otherwise dropped silently and padded with synthetic
+        # samples (see trainer_base._balance_batch). With VERL_STRICT_FAILED_GROUPS=1, refuse to train on them.
+        failed_selected = selected_uids & self.failure_keys[partition_id]
+        if partition_id != "val" and failed_selected and os.environ.get("VERL_STRICT_FAILED_GROUPS", "0") == "1":
+            raise RuntimeError(
+                f"[VERL_STRICT_FAILED_GROUPS] {len(failed_selected)}/{len(selected_uids)} selected prompt groups failed "
+                "during rollout/teacher scoring; refusing to train on a dropped+padded batch."
+            )
         return self._materialize_batch(partition_id, selected_prompt_uids, partition_snapshot), eviction_metrics
 
 

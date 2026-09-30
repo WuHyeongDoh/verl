@@ -15,6 +15,7 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import os
 import torch
 from tensordict import TensorDict
 
@@ -398,8 +399,46 @@ def compute_distillation_loss_reverse_kl_estimator(
     distillation_losses = kl_penalty(
         logprob=student_log_probs, ref_logprob=teacher_log_probs, kl_penalty=loss_config.loss_mode
     )
+    # [secopd] optional per-token dump for offline attribution of A_t = -k1 (env SECOPD_DUMP_AT_DIR).
+    # Saves, per micro-batch, the prompt/response token ids and the per-token student/teacher log-probs and k1
+    # on the padded [bsz, max_response_len] layout together with the response mask. Read-only side effect.
+    _dump_dir = os.environ.get("SECOPD_DUMP_AT_DIR")
+    if _dump_dir:
+        _secopd_dump_tokens(_dump_dir, data, student_log_probs, teacher_log_probs, distillation_losses, response_mask_bool)
     # Since k1 can be negative, log the mean absolute loss.
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
     return distillation_losses, metrics
+
+def _secopd_dump_tokens(dump_dir, data, student_lp, teacher_lp, k1, resp_mask):
+    """Write one .pt per micro-batch with everything needed to attribute A_t offline (SecOPD audit)."""
+    import itertools
+    import time as _time
+
+    global _SECOPD_DUMP_COUNTER
+    try:
+        _SECOPD_DUMP_COUNTER
+    except NameError:
+        _SECOPD_DUMP_COUNTER = itertools.count()
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
+    os.makedirs(dump_dir, exist_ok=True)
+
+    def _to_list_of_tensors(t):
+        if t.is_nested:
+            return [x.detach().cpu() for x in t.unbind()]
+        return [x.detach().cpu() for x in t]
+
+    prompts = _to_list_of_tensors(data["prompts"])
+    responses = _to_list_of_tensors(data["responses"])
+    rec = {
+        "prompts": prompts,
+        "responses": responses,
+        "student_logprob": student_lp.detach().float().cpu(),
+        "teacher_logprob": teacher_lp.detach().float().cpu(),
+        "k1": k1.detach().float().cpu(),
+        "response_mask": resp_mask.detach().cpu(),
+        "ts": _time.time(),
+    }
+    n = next(_SECOPD_DUMP_COUNTER)
+    torch.save(rec, os.path.join(dump_dir, f"rank{rank}_{n:05d}.pt"))

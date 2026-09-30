@@ -117,7 +117,9 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if hasattr(task_type, "value"):
             task_type = task_type.value
 
-        return {"r": lora_rank, "lora_alpha": lora_alpha, "task_type": str(task_type)}
+        # [secopd] carry per-module alphas so the exported adapter and the offline merge use the same scaling
+        alpha_pattern = {k: int(v) for k, v in (getattr(peft_config, "alpha_pattern", None) or {}).items()}
+        return {"r": lora_rank, "lora_alpha": lora_alpha, "task_type": str(task_type), "alpha_pattern": alpha_pattern}
 
     def _save_lora_train_meta(self, local_path: str, unwrap_model):
         lora_train_meta = self._get_lora_train_meta(unwrap_model)

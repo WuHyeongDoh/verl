@@ -15,6 +15,7 @@
 The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 """
 
+import json
 import logging
 import os
 import warnings
@@ -365,12 +366,33 @@ class FSDPEngine(BaseEngine):
                 "exclude_modules": convert_to_regular_types(self.model_config.exclude_modules),
                 "bias": "none",
             }
+            # [secopd] per-module LoRA alpha, e.g. SECOPD_LORA_ALPHA_PATTERN='{"lm_head": 54}'.
+            # The paper does not publish per-group alphas (Tinker's LoRA API groups attention / MLP / unembedding
+            # separately); the released checkpoint's unembedding delta is 1.74x ours while every other matrix matches
+            # within 4%, so this knob makes that a single-variable experiment. PEFT matches keys as
+            # `(.*\.)?<key>$`, so "lm_head" reaches the top-level module.
+            _alpha_pattern = os.environ.get("SECOPD_LORA_ALPHA_PATTERN")
+            if _alpha_pattern:
+                lora_config["alpha_pattern"] = {k: int(v) for k, v in json.loads(_alpha_pattern).items()}
+                logger.info(f"[secopd] LoRA alpha_pattern={lora_config['alpha_pattern']} (base alpha={lora_config['lora_alpha']})")
             module = get_peft_model(module, LoraConfig(**lora_config))
 
             # FSDP requires all params in a flat group to share dtype: cast a
             # fp32 adapter to the bf16 base dtype only when they actually differ.
+            # FSDP2 (fully_shard) has no flat groups and casts all-gather inputs to
+            # ``mp_policy.param_dtype`` per parameter, so a fp32 LoRA master copy over a
+            # bf16 base is supported there; keep it (SecOPD: lr=1e-4 updates would be
+            # rounded away by bf16 master weights).
             base_dtype = next((p.dtype for p in module.parameters() if not p.requires_grad), None)
-            if base_dtype is not None:
+            if base_dtype is not None and self.engine_config.strategy == "fsdp2":
+                n_fp32 = sum(1 for p in module.parameters() if p.requires_grad and p.dtype != base_dtype)
+                if n_fp32:
+                    logger.info(
+                        f"[secopd] keeping {n_fp32} LoRA adapter params in "
+                        f"{next(p.dtype for p in module.parameters() if p.requires_grad)} over "
+                        f"{base_dtype} base (FSDP2 mixed-dtype master weights)."
+                    )
+            elif base_dtype is not None:
                 mismatched = [p for p in module.parameters() if p.requires_grad and p.dtype != base_dtype]
                 if mismatched:
                     logger.info(

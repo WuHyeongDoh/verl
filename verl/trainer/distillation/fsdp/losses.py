@@ -162,6 +162,9 @@ def compute_forward_kl_topk(
 #   RR_META_TOKENS     path to a JSON list of token ids = the meta-cognitive lexicon (gate = meta)
 #   RR_GATE_TAU        teacher mass threshold  (default 0.5)
 #   RR_GATE_EPS        student mass threshold  (default 0.05)
+#   RR_GATE_WINDOW     1 = the gate may only fire on composite-teacher window rows (aux == 3; v3n CT arms)   (default 0)
+# Aux row codes (agent_loop RR_AUX_COL): 0 prompt, 1 student-sampled response token, 2 teacher-prefix token,
+#   3 student-sampled token inside the composite-teacher recognition window (RR_DUAL=1; scored by the recognition teacher).
 _RR_META_CACHE: dict = {}
 
 
@@ -217,9 +220,10 @@ def compute_rr_hybrid_terms(
     idx = resp.nonzero(as_tuple=True)[0]
     dev = logits.device
     z = torch.zeros(nnz, dtype=torch.float32, device=dev)
-    out = {k: z.clone() for k in ("rr_teacher_lp", "rr_gate", "rr_prefix", "rr_resp", "rr_meta_t", "rr_meta_s", "teacher_mass", "student_mass")}
+    out = {k: z.clone() for k in ("rr_teacher_lp", "rr_gate", "rr_prefix", "rr_window", "rr_resp", "rr_meta_t", "rr_meta_s", "teacher_mass", "student_mass")}
     out["rr_resp"] = resp.float()
-    out["rr_prefix"] = (aux > 1.5).float()
+    out["rr_prefix"] = ((aux > 1.5) & (aux < 2.5)).float()  # exactly code 2 (code 3 = composite window, v3n)
+    out["rr_window"] = (aux > 2.5).float()
     out["rr_teacher_lp"] = t_lp_all[:, 0].float()
     fkl_full = z.clone()
     if idx.numel() > 0:
@@ -265,8 +269,10 @@ def compute_rr_hybrid_terms(
                 gate = torch.zeros_like(t_mass, dtype=torch.bool)
             else:
                 raise ValueError(f"unknown RR_GATE={mode}")
-            is_prefix = aux[idx] > 1.5
+            is_prefix = (aux[idx] > 1.5) & (aux[idx] < 2.5)
             gate = gate & ~is_prefix  # the gate applies to student-sampled tokens only
+            if os.environ.get("RR_GATE_WINDOW", "0") == "1":
+                gate = gate & (aux[idx] > 2.5)  # composite teacher: gate only inside the recognition window
             out["rr_gate"][idx] = gate.float()
             out["rr_meta_t"][idx] = m_t
             out["rr_meta_s"][idx] = m_s

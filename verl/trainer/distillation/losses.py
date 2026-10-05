@@ -547,6 +547,16 @@ def rr_hybrid_distillation_loss(
             "distillation/student_mass": _mean(student_mass, resp),
         }
     )
+    if "rr_window" in model_output:  # v3n composite teacher (RR_DUAL=1): window rows are scored by the recognition teacher
+        window = no_padding_2_padding(model_output["rr_window"], data) > 0.5
+        metrics.update(
+            {
+                "distillation/rr_win_frac": (window & resp).sum().float().div(n_resp).item(),
+                "distillation/rr_win_seq_frac": (window & resp).any(dim=-1).float().mean().item(),
+                "distillation/rr_k1_in_win": _mean(k1, window & pg_mask),
+                "distillation/rr_k1_out_win": _mean(k1, ~window & pg_mask),
+            }
+        )
     _dump_dir = os.environ.get("SECOPD_DUMP_AT_DIR")
     if _dump_dir:
         _secopd_dump_tokens(_dump_dir, data, student_lp, teacher_lp, k1, resp)

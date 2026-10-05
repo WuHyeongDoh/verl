@@ -1081,6 +1081,9 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
+        if self.distillation_enabled and not validate and os.environ.get("RR_DUAL", "0") == "1":
+            await self._rr_dual_teacher_logprobs(output, prompt_ids, response_ids)
+            return
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -1130,6 +1133,72 @@ class AgentLoopWorker:
                 teacher_ids = torch.cat([teacher_ids, torch.zeros((P + R, 1), dtype=teacher_ids.dtype)], dim=1)
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+    async def _rr_dual_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids: list[int], response_ids: list[int]) -> None:
+        """[rr-opd v3n] Composite teacher (env RR_DUAL=1; used only with LOSS_MODE=rr_hybrid, which sets RR_AUX_COL=1).
+
+        Teacher B (routing key RR_KEY_B) scores the whole response under ``teacher_prompt_ids`` (the clean twin; SecOPD /
+        B1 teacher).  Teacher A (routing key RR_KEY_A; the recognition teacher) scores only the first ``Wa`` response tokens
+        under ``rr_teacher_prompt_a_ids`` (the student's own attacked prompt, or a scaffolded prompt for the prompted teacher),
+        where ``Wa = max(window, teacher_prefix)`` comes from the agent loop.  Rows ``[P-1, P-1+Wa)`` of B's re-laid output are
+        replaced by A's.  Aux codes: 1 = student token scored by B, 2 = teacher-prefix token (CE), 3 = student token in the
+        recognition window scored by A.  Window tokens listed in ``rr_window_leak_idx`` (prompted teacher: scaffold-quoting
+        spans) stay with B (aux 1).  With a single configured teacher the keys may be unset (both calls go to that teacher).
+        """
+        import asyncio
+
+        assert os.environ.get("RR_AUX_COL", "0") == "1", "RR_DUAL=1 needs RR_AUX_COL=1 (LOSS_MODE=rr_hybrid)"
+        P, R = len(prompt_ids), len(response_ids)
+        b_prompt = [int(t) for t in output.extra_fields.pop("teacher_prompt_ids")]
+        a_prompt = output.extra_fields.pop("rr_teacher_prompt_a_ids", None)
+        a_prompt = [int(t) for t in a_prompt] if a_prompt is not None else [int(t) for t in prompt_ids]
+        n_prefix = min(int(output.extra_fields.get("rr_teacher_prefix_len", 0) or 0), R)
+        win = min(int(output.extra_fields.get("rr_window_len", 0) or 0), R)
+        wa = max(win, n_prefix)
+        leak = [int(j) for j in (output.extra_fields.get("rr_window_leak_idx") or [])]
+        key_a, key_b = os.environ.get("RR_KEY_A") or None, os.environ.get("RR_KEY_B") or None
+        mgr = self.teacher_server_manager
+
+        async def score(t_prompt: list[int], resp: list[int], key):
+            ids, lps = await mgr.compute_teacher_logprobs_single(
+                sequence_ids=t_prompt + resp,
+                multi_modal_data=output.multi_modal_data,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+                mm_processor_output=getattr(output, "mm_processor_output", None),
+                routing_key=key,
+            )
+            return relayout_teacher_outputs(ids, lps, teacher_prompt_len=len(t_prompt), prompt_ids=prompt_ids, response_ids=resp)
+
+        calls = [score(b_prompt, response_ids, key_b)]
+        if wa > 0:
+            calls.append(score(a_prompt, response_ids[:wa], key_a))
+        res = await asyncio.gather(*calls)
+        teacher_ids, teacher_logprobs = res[0]
+        assert teacher_logprobs.dim() == 2 and teacher_logprobs.shape[0] == P + R, (teacher_logprobs.shape, P, R)
+        aux = torch.zeros((P + R, 1), dtype=teacher_logprobs.dtype)
+        aux[P - 1 : P - 1 + R] = 1.0
+        n_leak = 0
+        if wa > 0:
+            a_ids, a_lps = res[1]
+            assert a_lps.shape[0] == P + wa and a_lps.shape[1:] == teacher_logprobs.shape[1:], (a_lps.shape, teacher_logprobs.shape, P, wa)
+            b_ids, b_lps = teacher_ids, teacher_logprobs
+            teacher_ids, teacher_logprobs = b_ids.clone(), b_lps.clone()
+            teacher_ids[P - 1 : P - 1 + wa] = a_ids[P - 1 : P - 1 + wa]
+            teacher_logprobs[P - 1 : P - 1 + wa] = a_lps[P - 1 : P - 1 + wa]
+            aux[P - 1 : P - 1 + wa] = 3.0
+            if n_prefix > 0:
+                aux[P - 1 : P - 1 + n_prefix] = 2.0
+            for j in leak:
+                if n_prefix <= j < wa:
+                    teacher_ids[P - 1 + j] = b_ids[P - 1 + j]
+                    teacher_logprobs[P - 1 + j] = b_lps[P - 1 + j]
+                    aux[P - 1 + j] = 1.0
+                    n_leak += 1
+        output.extra_fields["rr_dual_stats"] = {"wa": wa, "window": win, "prefix": n_prefix, "leak_routed": n_leak}
+        teacher_logprobs = torch.cat([teacher_logprobs, aux], dim=1)
+        teacher_ids = torch.cat([teacher_ids, torch.zeros((P + R, 1), dtype=teacher_ids.dtype)], dim=1)
+        output.extra_fields["teacher_ids"] = teacher_ids
+        output.extra_fields["teacher_logprobs"] = teacher_logprobs
 
     def _postprocess(
         self,

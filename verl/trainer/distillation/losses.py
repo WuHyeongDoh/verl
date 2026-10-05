@@ -141,6 +141,8 @@ def compute_topk_loss(
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            if distillation_config.distillation_loss.loss_mode == "rr_hybrid":
+                distillation_loss_fn = fsdp_losses.compute_rr_hybrid_terms
         case "megatron":
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
@@ -243,6 +245,8 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    if loss_config.loss_mode == "rr_hybrid":
+        return rr_hybrid_distillation_loss(config, distillation_config, model_output, data)
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
     distillation_losses, distillation_metrics = distillation_loss_fn(
         config=config,
@@ -442,3 +446,108 @@ def _secopd_dump_tokens(dump_dir, data, student_lp, teacher_lp, k1, resp_mask):
     }
     n = next(_SECOPD_DUMP_COUNTER)
     torch.save(rec, os.path.join(dump_dir, f"rank{rank}_{n:05d}.pt"))
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# [rr-opd] rr_hybrid: sampled reverse KL (k1 policy gradient) on most response tokens, top-K forward KL on
+#   (a) gated tokens  -- positions where the teacher puts mass on tokens the student (almost) never samples
+#                        (RR_GATE=meta restricts this to a meta-cognitive lexicon; see fsdp/losses.py), and
+#   (b) teacher-sampled prefix tokens of teacher-prefix rollouts (the student did not sample them, so the
+#       score-function estimator does not apply there; forward KL / cross-entropy is the on-distribution loss).
+# total = PG_k1(mask = response & ~fkl) + RR_FKL_COEF * sum_t FKL_t (mask = response & fkl), both aggregated with
+# the actor's loss_agg_mode over the same global batch.
+@register_distillation_loss(DistillationLossSettings(names=["rr_hybrid"], use_topk=True))  # type: ignore[arg-type]
+def _rr_hybrid_registered(config, distillation_config, model_output, data):  # pragma: no cover - dispatch happens in distillation_loss
+    raise RuntimeError("rr_hybrid is computed by rr_hybrid_distillation_loss")
+
+
+def rr_hybrid_distillation_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    assert loss_config.use_policy_gradient, "rr_hybrid needs use_policy_gradient=True (k1 term)"
+    loss_agg_mode = config.loss_agg_mode
+
+    student_lp = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_lp = no_padding_2_padding(model_output["rr_teacher_lp"], data)
+    fkl = no_padding_2_padding(model_output["rr_fkl"], data)
+    gate = no_padding_2_padding(model_output["rr_gate"], data) > 0.5
+    prefix = no_padding_2_padding(model_output["rr_prefix"], data) > 0.5
+    meta_t = no_padding_2_padding(model_output["rr_meta_t"], data)
+    meta_s = no_padding_2_padding(model_output["rr_meta_s"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    response_mask = data["response_mask"]
+    if response_mask.is_nested:
+        response_mask = response_mask.to_padded_tensor(False)
+    resp = response_mask.bool()
+    assert student_lp.shape == teacher_lp.shape == fkl.shape == resp.shape, (student_lp.shape, teacher_lp.shape, fkl.shape, resp.shape)
+
+    # loss on teacher-sampled prefix tokens: ce = -log pi_theta(y_T) (TrOPD paper form, default) | fkl = top-K forward KL | none
+    prefix_loss = os.environ.get("RR_PREFIX_LOSS", "ce")
+    fkl_coef = float(os.environ.get("RR_FKL_COEF", "1.0"))
+    prefix_coef = float(os.environ.get("RR_PREFIX_COEF", "1.0"))
+    gate = gate & ~prefix  # the gate applies to student-sampled tokens only
+    sup_prefix = prefix & resp if prefix_loss in ("ce", "fkl") else torch.zeros_like(prefix)
+    pg_mask = resp & ~gate & ~prefix
+
+    k1 = (student_lp - teacher_lp).detach()  # = kl_penalty(..., "k1")
+    if loss_config.loss_max_clamp is not None:
+        k1 = k1.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    for k, v in config.global_batch_info.items():
+        loss_config.global_batch_info[k] = v
+
+    policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
+    old_log_prob = data["old_log_probs"]
+    if old_log_prob.is_nested:
+        old_log_prob = old_log_prob.to_padded_tensor(0.0)
+    pg_loss, pg_metrics = policy_loss_fn(
+        old_log_prob=old_log_prob,
+        log_prob=student_lp,
+        advantages=-k1,
+        response_mask=pg_mask.to(response_mask.dtype),
+        loss_agg_mode=loss_agg_mode,
+        config=loss_config,
+        rollout_is_weights=data.get("rollout_is_weights", None),
+    )
+    fkl_loss = agg_loss(loss_mat=fkl, loss_mask=(gate & resp).to(fkl.dtype), loss_agg_mode=loss_agg_mode, **config.global_batch_info)
+    prefix_mat = -student_lp.float() if prefix_loss == "ce" else fkl
+    prefix_sup = agg_loss(loss_mat=prefix_mat, loss_mask=sup_prefix.to(fkl.dtype), loss_agg_mode=loss_agg_mode, **config.global_batch_info)
+    total = pg_loss + fkl_coef * fkl_loss + prefix_coef * prefix_sup
+
+    def _mean(x, m):
+        return x[m].float().mean().item() if m.any() else 0.0
+
+    n_resp = resp.sum().clamp_min(1).float()
+    metrics: dict[str, Any] = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
+    metrics.update(
+        {
+            "distillation/abs_loss": Metric(AggregationType.MEAN, k1[pg_mask].abs().mean() if pg_mask.any() else k1.new_zeros(())),
+            "distillation/rr_pg_loss": pg_loss.detach().item(),
+            "distillation/rr_fkl_loss": fkl_loss.detach().item(),
+            "distillation/rr_prefix_loss": prefix_sup.detach().item(),
+            "distillation/rr_prefix_nll": _mean(-student_lp.detach(), prefix & resp),
+            "distillation/rr_gate_frac": (gate & resp).sum().float().div(n_resp).item(),
+            "distillation/rr_gate_seq_frac": (gate & resp).any(dim=-1).float().mean().item(),
+            "distillation/rr_prefix_frac": (prefix & resp).sum().float().div(n_resp).item(),
+            "distillation/rr_fkl_gated": _mean(fkl.detach(), gate & resp),
+            "distillation/rr_fkl_prefix": _mean(fkl.detach(), prefix & resp),
+            "distillation/rr_fkl_all": _mean(fkl.detach(), resp),
+            "distillation/rr_meta_t_gated": _mean(meta_t, gate & resp),
+            "distillation/rr_meta_s_gated": _mean(meta_s, gate & resp),
+            "distillation/teacher_mass": _mean(teacher_mass, resp),
+            "distillation/student_mass": _mean(student_mass, resp),
+        }
+    )
+    _dump_dir = os.environ.get("SECOPD_DUMP_AT_DIR")
+    if _dump_dir:
+        _secopd_dump_tokens(_dump_dir, data, student_lp, teacher_lp, k1, resp)
+    return total, metrics

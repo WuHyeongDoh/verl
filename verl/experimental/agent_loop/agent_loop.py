@@ -730,6 +730,11 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            # [rr-opd] teacher-prefix rollouts: give the loop access to the teacher servers and the training step
+            # (used only by loops that opt in, e.g. secopd_single_turn with RR_PREFIX_H0 > 0).
+            agent_loop.rr_teacher_manager = getattr(self, "teacher_server_manager", None)
+            agent_loop.rr_global_step = trajectory["step"]
+            agent_loop.rr_validate = trajectory["validate"]
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
@@ -1110,6 +1115,19 @@ class AgentLoopWorker:
                     mm_processor_output=getattr(output, "mm_processor_output", None),
                     routing_key=routing_key,
                 )
+            # [rr-opd] auxiliary per-token channel for the hybrid loss (env RR_AUX_COL=1): one extra trailing column whose
+            # logprob slot carries a row marker in the prediction-position layout -- 0 = prompt row, 1 = response token
+            # sampled by the student, 2 = response token sampled by the TEACHER (teacher-prefix rollout).
+            if os.environ.get("RR_AUX_COL", "0") == "1":
+                P, R = len(prompt_ids), len(response_ids)
+                n_prefix = min(int(output.extra_fields.get("rr_teacher_prefix_len", 0) or 0), R)
+                assert teacher_logprobs.dim() == 2 and teacher_logprobs.shape[0] == P + R, (teacher_logprobs.shape, P, R)
+                aux = torch.zeros((P + R, 1), dtype=teacher_logprobs.dtype)
+                aux[P - 1 : P - 1 + R] = 1.0
+                if n_prefix > 0:
+                    aux[P - 1 : P - 1 + n_prefix] = 2.0
+                teacher_logprobs = torch.cat([teacher_logprobs, aux], dim=1)
+                teacher_ids = torch.cat([teacher_ids, torch.zeros((P + R, 1), dtype=teacher_ids.dtype)], dim=1)
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

@@ -538,13 +538,23 @@ def build_mtp_speculative_config(
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
-    """Extract prompt log probabilities from generation output."""
+    """Extract prompt log probabilities from generation output.
+
+    [rr-opd] With env ``RR_TOPK_WITH_ACTUAL=1`` and top-k scoring (``num_prompt_logprobs > 0``) every row gets one extra
+    leading column holding the id / logprob of the token that is actually in the sequence, i.e. the layout becomes
+    ``[actual, top-1, ..., top-K]``.  The hybrid distillation loss (``rr_hybrid``) needs both the sampled token's teacher
+    logprob (reverse-KL policy-gradient term) and the teacher's top-K distribution (forward-KL term) from one pass.
+    """
     if num_prompt_logprobs is None:
         return
 
+    import os as _os
+
+    keep_actual = _os.environ.get("RR_TOPK_WITH_ACTUAL", "0") == "1" and num_prompt_logprobs > 0
+    seq_ids = list(output.prompt_token_ids) if keep_actual else None
     prompt_logprobs_ls, prompt_ids_ls = [], []
     # NOTE: logprob of first prompt token is None.
-    for logprobs_dict in output.prompt_logprobs[1:]:
+    for pos, logprobs_dict in enumerate(output.prompt_logprobs[1:], start=1):
         if num_prompt_logprobs == 0:
             token_id_str = list(logprobs_dict.keys())[0]
             logprob = logprobs_dict[token_id_str].logprob
@@ -555,19 +565,27 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
             prompt_logprobs = [None] * num_prompt_logprobs
             # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
             assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+            actual_lp = None
             for token_id_str, token_logprob in logprobs_dict.items():
+                if keep_actual and int(token_id_str) == seq_ids[pos]:
+                    actual_lp = token_logprob.logprob
                 rank = token_logprob.rank
                 if rank > num_prompt_logprobs:
                     continue  # the sampled token is not in the top-k
                 logprob = token_logprob.logprob
                 prompt_ids[rank - 1] = int(token_id_str)
                 prompt_logprobs[rank - 1] = logprob
+            if keep_actual:
+                assert actual_lp is not None, f"actual token {seq_ids[pos]} missing from prompt_logprobs at position {pos}"
+                prompt_ids = [int(seq_ids[pos])] + prompt_ids
+                prompt_logprobs = [actual_lp] + prompt_logprobs
             prompt_logprobs_ls.append(prompt_logprobs)
             prompt_ids_ls.append(prompt_ids)
 
     # NOTE: pad a dummy prompt logprob for last prompt token.
-    prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
-    prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+    width = max(num_prompt_logprobs, 1) + (1 if keep_actual else 0)
+    prompt_logprobs_ls.append([0.0] * width)
+    prompt_ids_ls.append([0] * width)
 
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls

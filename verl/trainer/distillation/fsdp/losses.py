@@ -147,3 +147,136 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# [rr-opd] Hybrid distillation terms: sampled reverse-KL (policy gradient) on most tokens, top-K forward KL on gated
+# tokens.  Teacher tensors use the layout  [actual | top-1 .. top-K | aux]  (see extract_prompt_logprobs with
+# RR_TOPK_WITH_ACTUAL=1 and AgentLoopWorker._compute_teacher_logprobs with RR_AUX_COL=1):
+#   column 0      : id / teacher logprob of the token that is in the sequence (the sampled token)
+#   columns 1..K  : the teacher's top-K ids / logprobs at this prefix
+#   column K+1    : logprob slot = row marker (0 prompt row, 1 student-sampled response token, 2 teacher-sampled prefix)
+# Everything is computed on response rows only (fp32), so the memory cost scales with the response length.
+# Env knobs (read once per call; all optional):
+#   RR_GATE            off | meta | support          (default off)
+#   RR_META_TOKENS     path to a JSON list of token ids = the meta-cognitive lexicon (gate = meta)
+#   RR_GATE_TAU        teacher mass threshold  (default 0.5)
+#   RR_GATE_EPS        student mass threshold  (default 0.05)
+_RR_META_CACHE: dict = {}
+
+
+def _rr_meta_ids(device) -> torch.Tensor | None:
+    import json
+    import os
+
+    path = os.environ.get("RR_META_TOKENS", "")
+    if not path:
+        return None
+    key = (path, str(device))
+    if key not in _RR_META_CACHE:
+        ids = json.load(open(path))
+        ids = ids["ids"] if isinstance(ids, dict) else ids
+        _RR_META_CACHE[key] = torch.tensor(sorted(set(int(i) for i in ids)), dtype=torch.long, device=device)
+    return _RR_META_CACHE[key]
+
+
+def compute_rr_hybrid_terms(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Per-token terms for the hybrid loss.  All returned tensors have shape (1, total_nnz); only ``rr_fkl`` carries grad.
+
+    rr_fkl        KL( p~_T || p_theta ) with the teacher renormalised over its top-K and the student's FULL-vocabulary
+                  log-probabilities (so minimising it moves absolute student mass onto the teacher's tokens); the value is
+                  filled on every response row, the gradient only on rows whose forward KL enters the loss (gated rows,
+                  and teacher-prefix rows when RR_PREFIX_LOSS=fkl)
+    rr_teacher_lp teacher logprob of the sampled token (for the k1 / reverse-KL policy-gradient term)
+    rr_gate       1 where the forward-KL term replaces the policy-gradient term (gate), else 0
+    rr_prefix     1 where the token was sampled by the teacher (teacher-prefix rollout), else 0
+    rr_resp       1 on response rows
+    rr_meta_t / rr_meta_s   teacher / student mass on the gate's token set (diagnostics)
+    teacher_mass / student_mass   mass inside the teacher's top-K
+    """
+    import os
+
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    assert get_ulysses_sequence_parallel_world_size() == 1, "rr_hybrid does not support Ulysses sequence parallelism"
+    t_lp_all = teacher_topk_log_probs.values()  # (nnz, K+2)
+    t_ids_all = teacher_topk_ids.values()
+    logits = student_logits.squeeze(0)  # (nnz, V)
+    nnz = logits.shape[0]
+    assert t_lp_all.shape[0] == t_ids_all.shape[0] == nnz, (t_lp_all.shape, t_ids_all.shape, logits.shape)
+    K = t_lp_all.shape[-1] - 2
+    assert K >= 1, f"rr_hybrid expects teacher tensors [actual | top-K | aux], got width {t_lp_all.shape[-1]}"
+
+    aux = t_lp_all[:, K + 1]
+    resp = aux > 0.5
+    idx = resp.nonzero(as_tuple=True)[0]
+    dev = logits.device
+    z = torch.zeros(nnz, dtype=torch.float32, device=dev)
+    out = {k: z.clone() for k in ("rr_teacher_lp", "rr_gate", "rr_prefix", "rr_resp", "rr_meta_t", "rr_meta_s", "teacher_mass", "student_mass")}
+    out["rr_resp"] = resp.float()
+    out["rr_prefix"] = (aux > 1.5).float()
+    out["rr_teacher_lp"] = t_lp_all[:, 0].float()
+    fkl_full = z.clone()
+    if idx.numel() > 0:
+        t_lp = t_lp_all[idx, 1 : K + 1].float()  # (R, K)
+        t_ids = t_ids_all[idx, 1 : K + 1].long()
+        p_t = t_lp.exp()
+        t_mass = p_t.sum(dim=-1)
+        p_tn = p_t / t_mass.clamp_min(1e-8).unsqueeze(-1)
+        log_p_tn = p_tn.clamp_min(1e-12).log()
+        chunk = int(os.environ.get("RR_ROW_CHUNK", "1024"))
+
+        def student_topk_lp(rows: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            """Student full-vocabulary log-probs at `ids` for logits rows `rows` (fp32, chunked).  index_select copies the
+            rows, so this path is independent of the in-place backward of the flash-attn cross-entropy on `logits`."""
+            parts = []
+            for s0 in range(0, rows.numel(), chunk):
+                lg = logits.index_select(0, rows[s0 : s0 + chunk]).float()
+                parts.append(torch.gather(lg, dim=-1, index=ids[s0 : s0 + chunk]) - torch.logsumexp(lg, dim=-1, keepdim=True))
+            return torch.cat(parts, dim=0)
+
+        # pass 1 (no grad, all response rows): student mass on the teacher's top-K -> gate + diagnostics.
+        with torch.no_grad():
+            s_lp = student_topk_lp(idx, t_ids)
+            p_s = s_lp.exp()
+            fkl_ng = (p_tn * (log_p_tn - s_lp)).sum(dim=-1).clamp_min(0.0)
+            out["teacher_mass"][idx] = t_mass
+            out["student_mass"][idx] = p_s.sum(dim=-1)
+            mode = os.environ.get("RR_GATE", "off")
+            tau = float(os.environ.get("RR_GATE_TAU", "0.5"))
+            eps = float(os.environ.get("RR_GATE_EPS", "0.05"))
+            if mode == "meta":
+                meta = _rr_meta_ids(dev)
+                assert meta is not None, "RR_GATE=meta needs RR_META_TOKENS"
+                sel = torch.isin(t_ids, meta)
+                m_t, m_s = (p_t * sel).sum(dim=-1), (p_s * sel).sum(dim=-1)
+                gate = (m_t >= tau) & (m_s <= eps)
+            elif mode == "support":
+                sel = p_s < eps  # teacher-preferred tokens the student (almost) never samples
+                m_t, m_s = (p_t * sel).sum(dim=-1), (p_s * sel).sum(dim=-1)
+                gate = m_t >= tau
+            elif mode == "off":
+                m_t, m_s = torch.zeros_like(t_mass), torch.zeros_like(t_mass)
+                gate = torch.zeros_like(t_mass, dtype=torch.bool)
+            else:
+                raise ValueError(f"unknown RR_GATE={mode}")
+            is_prefix = aux[idx] > 1.5
+            gate = gate & ~is_prefix  # the gate applies to student-sampled tokens only
+            out["rr_gate"][idx] = gate.float()
+            out["rr_meta_t"][idx] = m_t
+            out["rr_meta_s"][idx] = m_s
+            need = gate | (is_prefix if os.environ.get("RR_PREFIX_LOSS", "ce") == "fkl" else torch.zeros_like(gate))
+        fkl_full = fkl_full.index_put((idx,), fkl_ng)
+        # pass 2 (with grad): only the rows whose forward KL enters the loss, so memory scales with the gated rows
+        sel_rows = need.nonzero(as_tuple=True)[0]
+        if sel_rows.numel() > 0:
+            s_lp_g = student_topk_lp(idx[sel_rows], t_ids[sel_rows])
+            fkl_g = (p_tn[sel_rows] * (log_p_tn[sel_rows] - s_lp_g)).sum(dim=-1).clamp_min(0.0)
+            fkl_full = fkl_full.index_put((idx[sel_rows],), fkl_g)
+    out["rr_fkl"] = fkl_full
+    return {k: v.unsqueeze(0) for k, v in out.items()}

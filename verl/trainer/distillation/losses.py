@@ -392,7 +392,15 @@ def compute_distillation_loss_reverse_kl_estimator(
     - distillation_metrics: Dictionary of metrics.
     """
     student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
-    teacher_log_probs = no_padding_2_padding(data["teacher_logprobs"], data).squeeze(-1)
+    teacher_all = no_padding_2_padding(data["teacher_logprobs"], data)
+    # [rr-opd MOPD PoC] with RR_MT set the agent loop returns [used | A | B | domain] (agent_loop._rr_mt_teacher_logprobs): the
+    # estimator trains on column 0 and logs per-domain diagnostics from the rest. Unset -> unchanged (width-1 squeeze).
+    rr_mt_cols = None
+    if os.environ.get("RR_MT", "") and teacher_all.dim() == 3 and teacher_all.shape[-1] == 4:
+        rr_mt_cols = teacher_all
+        teacher_log_probs = teacher_all[..., 0]
+    else:
+        teacher_log_probs = teacher_all.squeeze(-1)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
@@ -413,7 +421,35 @@ def compute_distillation_loss_reverse_kl_estimator(
     metrics = {
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
+    if rr_mt_cols is not None:
+        metrics.update(_rr_mt_metrics(rr_mt_cols, student_log_probs, distillation_losses, response_mask_bool))
     return distillation_losses, metrics
+
+
+def _rr_mt_metrics(cols, student_lp, k1_used, resp_mask):
+    """[rr-opd MOPD PoC] per-domain diagnostics of the two-teacher signal (cols = [used | A | B | domain], k1 = student - teacher).
+    Emitted as SUMS over the micro-batch's response tokens, for BOTH domains in EVERY micro-batch (zeros when a domain is absent):
+    Metric.aggregate_dp requires the same number of values on every dp rank, so nothing may be emitted conditionally (the first
+    smoke run failed with "[2, 3]" when a domain was missing from some micro-batches). Per domain d in {A, B}:
+      mt_d_n (tokens), mt_d_k1_sum, mt_d_k1_sq_sum, mt_d_k1A_sum, mt_d_k1B_sum (k1 against teacher A / B), mt_d_dlp_sum (lpA - lpB),
+      mt_d_clip5_n (|k1| > 5; MOPD 2606.30406 clips at 5). Means / std / shares are derived offline (scripts/mopd/mopd_table.py):
+      k1_mean = k1_sum / n, k1_std = sqrt(k1_sq_sum / n - mean^2) (DN-MOPD 2609.35347 scale imbalance), tok_share = n_d / (n_A + n_B).
+    With SUM aggregation VERL logs (sum over micro-batches of the dp-rank mean), which divides every sum and count by the same dp
+    size, so the ratios stay exact."""
+    out = {}
+    dom = cols[..., 3]
+    k1_a = student_lp - cols[..., 1]
+    k1_b = student_lp - cols[..., 2]
+    dlp = cols[..., 1] - cols[..., 2]
+    for code, name in ((1.0, "A"), (2.0, "B")):
+        m = resp_mask & (dom == code)
+        n = int(m.sum())
+        ku = k1_used[m]
+        vals = {"n": float(n), "k1_sum": float(ku.sum()), "k1_sq_sum": float((ku * ku).sum()), "k1A_sum": float(k1_a[m].sum()),
+                "k1B_sum": float(k1_b[m].sum()), "dlp_sum": float(dlp[m].sum()), "clip5_n": float((ku.abs() > 5.0).sum())}
+        for k, v in vals.items():
+            out[f"distillation/mt_{name}_{k}"] = Metric(AggregationType.SUM, v)
+    return out
 
 def _secopd_dump_tokens(dump_dir, data, student_lp, teacher_lp, k1, resp_mask):
     """Write one .pt per micro-batch with everything needed to attribute A_t offline (SecOPD audit)."""

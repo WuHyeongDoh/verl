@@ -1081,6 +1081,9 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
+        if self.distillation_enabled and not validate and os.environ.get("RR_MT", ""):
+            await self._rr_mt_teacher_logprobs(output, prompt_ids, response_ids, sample_kwargs)
+            return
         if self.distillation_enabled and not validate and os.environ.get("RR_DUAL", "0") == "1":
             await self._rr_dual_teacher_logprobs(output, prompt_ids, response_ids)
             return
@@ -1197,6 +1200,63 @@ class AgentLoopWorker:
         output.extra_fields["rr_dual_stats"] = {"wa": wa, "window": win, "prefix": n_prefix, "leak_routed": n_leak}
         teacher_logprobs = torch.cat([teacher_logprobs, aux], dim=1)
         teacher_ids = torch.cat([teacher_ids, torch.zeros((P + R, 1), dtype=teacher_ids.dtype)], dim=1)
+        output.extra_fields["teacher_ids"] = teacher_ids
+        output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+    async def _rr_mt_teacher_logprobs(
+        self, output: AgentLoopOutput, prompt_ids: list[int], response_ids: list[int], sample_kwargs: Optional[dict[str, Any]]
+    ) -> None:
+        """[rr-opd MOPD PoC, 2026-10-07] Two domain teachers (routing keys RR_KEY_A / RR_KEY_B, default "A" / "B") score the SAME
+        sequence ``teacher_prompt_ids + response`` (re-laid onto the student layout like the single-teacher path).  Only for the
+        sampled-token estimators (LOSS_MODE k1 family: teacher width 1).
+
+        RR_MT=route : column 0 = the teacher selected by the sample's domain label (MOPD label routing, arXiv 2606.30406 §3.1; the
+                      training signal is identical to stock per-sample routing, the other teacher is scored for diagnostics only).
+        RR_MT=mean  : column 0 = 0.5 * (log p_A + log p_B)  (uniform "Mean aggregation" of MOPD-Router 2609.30837 / "Uniform" of
+                      TrustMOPD 2609.23697; k1 against it = the mean of the two per-teacher k1 terms).
+        Domain label: ``sample_kwargs[self.teacher_key]`` (default column ``data_source``) == RR_MT_DOMAIN_B (default
+        "rr-opd-agentic") -> teacher B, anything else -> teacher A.
+        Output columns ``[used | A | B | domain]`` with domain = 1 (A-domain) / 2 (B-domain) on response rows and 0 on prompt rows;
+        the k1 estimator reads column 0 and logs per-domain diagnostics from the others (losses.py, RR_MT set).
+        """
+        import asyncio
+
+        mode = os.environ["RR_MT"]
+        assert mode in ("route", "mean"), f"RR_MT must be route|mean, got {mode!r}"
+        key_a, key_b = os.environ.get("RR_KEY_A") or "A", os.environ.get("RR_KEY_B") or "B"
+        dom_b = os.environ.get("RR_MT_DOMAIN_B", "rr-opd-agentic")
+        rv = sample_kwargs.get(self.teacher_key) if sample_kwargs is not None else None
+        rv = rv.item() if hasattr(rv, "item") else rv
+        is_b = rv is not None and str(rv) == dom_b
+        P, R = len(prompt_ids), len(response_ids)
+        tp = output.extra_fields.pop("teacher_prompt_ids", None)
+        t_prompt = [int(t) for t in tp] if tp is not None else [int(t) for t in prompt_ids]
+        mgr = self.teacher_server_manager
+
+        async def score(key):
+            ids, lps = await mgr.compute_teacher_logprobs_single(
+                sequence_ids=t_prompt + response_ids,
+                multi_modal_data=output.multi_modal_data,
+                mm_processor_kwargs=output.mm_processor_kwargs,
+                mm_processor_output=getattr(output, "mm_processor_output", None),
+                routing_key=key,
+            )
+            return relayout_teacher_outputs(ids, lps, teacher_prompt_len=len(t_prompt), prompt_ids=prompt_ids, response_ids=response_ids)
+
+        (a_ids, a_lps), (b_ids, b_lps) = await asyncio.gather(score(key_a), score(key_b))
+        assert a_lps.dim() == 2 and a_lps.shape == b_lps.shape and a_lps.shape[0] == P + R and a_lps.shape[1] == 1, (
+            a_lps.shape, b_lps.shape, P, R, "RR_MT needs width-1 (sampled-token) teacher outputs")
+        used_lps = (b_lps if is_b else a_lps) if mode == "route" else 0.5 * (a_lps + b_lps)
+        used_ids = b_ids if is_b else a_ids
+        dom = torch.zeros((P + R, 1), dtype=a_lps.dtype)
+        dom[P - 1 : P - 1 + R] = 2.0 if is_b else 1.0
+        teacher_logprobs = torch.cat([used_lps, a_lps, b_lps, dom], dim=1)
+        teacher_ids = torch.cat([used_ids, a_ids, b_ids, torch.zeros_like(a_ids)], dim=1)
+        rows = slice(P - 1, P - 1 + R)
+        la = float(a_lps[rows, 0].mean()) if R > 0 else 0.0
+        lb = float(b_lps[rows, 0].mean()) if R > 0 else 0.0
+        output.extra_fields["rr_mt_stats"] = {"mode": mode, "domain": "B" if is_b else "A", "lpA": la, "lpB": lb, "resp_len": R}
+        print(f"[secopd] mt mode={mode} dom={'B' if is_b else 'A'} label={rv} resp_len={R} lpA={la:.4f} lpB={lb:.4f}", flush=True)
         output.extra_fields["teacher_ids"] = teacher_ids
         output.extra_fields["teacher_logprobs"] = teacher_logprobs
 

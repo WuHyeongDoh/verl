@@ -1244,15 +1244,34 @@ class AgentLoopWorker:
             return relayout_teacher_outputs(ids, lps, teacher_prompt_len=len(t_prompt), prompt_ids=prompt_ids, response_ids=response_ids)
 
         (a_ids, a_lps), (b_ids, b_lps) = await asyncio.gather(score(key_a), score(key_b))
-        assert a_lps.dim() == 2 and a_lps.shape == b_lps.shape and a_lps.shape[0] == P + R and a_lps.shape[1] == 1, (
-            a_lps.shape, b_lps.shape, P, R, "RR_MT needs width-1 (sampled-token) teacher outputs")
-        used_lps = (b_lps if is_b else a_lps) if mode == "route" else 0.5 * (a_lps + b_lps)
-        used_ids = b_ids if is_b else a_ids
-        dom = torch.zeros((P + R, 1), dtype=a_lps.dtype)
-        dom[P - 1 : P - 1 + R] = 2.0 if is_b else 1.0
-        teacher_logprobs = torch.cat([used_lps, a_lps, b_lps, dom], dim=1)
-        teacher_ids = torch.cat([used_ids, a_ids, b_ids, torch.zeros_like(a_ids)], dim=1)
+        assert a_lps.dim() == 2 and a_lps.shape == b_lps.shape and a_lps.shape[0] == P + R, (a_lps.shape, b_lps.shape, P, R)
         rows = slice(P - 1, P - 1 + R)
+        if a_lps.shape[1] == 1:
+            # sampled-token estimators (LOSS_MODE k1 family): columns [used | A | B | domain]
+            used_lps = (b_lps if is_b else a_lps) if mode == "route" else 0.5 * (a_lps + b_lps)
+            used_ids = b_ids if is_b else a_ids
+            dom = torch.zeros((P + R, 1), dtype=a_lps.dtype)
+            dom[rows] = 2.0 if is_b else 1.0
+            teacher_logprobs = torch.cat([used_lps, a_lps, b_lps, dom], dim=1)
+            teacher_ids = torch.cat([used_ids, a_ids, b_ids, torch.zeros_like(a_ids)], dim=1)
+        else:
+            # [rr-opd HCL x MOPD, 2026-10-07] top-K teacher outputs (LOSS_MODE=rr_hybrid: RR_TOPK_WITH_ACTUAL=1 -> [actual | top-K]):
+            # the hybrid loss reads a fixed [actual | top-K | aux] layout, so the ROUTED teacher's top-K distribution (ids + logprobs)
+            # is kept for the gate / forward-KL term; `mean` only replaces column 0 (the sampled token's logprob, used by the k1
+            # term) by 0.5 * (lpA + lpB). The two teachers' top-K supports differ, so no mixture of the top-K distributions is formed.
+            # Aux column: 1 on response rows (student-sampled); teacher-prefix rollouts are not supported here.
+            assert os.environ.get("RR_TOPK_WITH_ACTUAL", "0") == "1" and os.environ.get("RR_AUX_COL", "0") == "1", (
+                "RR_MT with top-K teacher outputs needs RR_TOPK_WITH_ACTUAL=1 RR_AUX_COL=1 (LOSS_MODE=rr_hybrid)")
+            n_prefix = int(output.extra_fields.get("rr_teacher_prefix_len", 0) or 0)
+            assert n_prefix == 0, "RR_MT does not support teacher-prefix rollouts (RR_PREFIX_TP)"
+            used_lps = (b_lps if is_b else a_lps).clone()
+            used_ids = (b_ids if is_b else a_ids).clone()
+            if mode == "mean":
+                used_lps[rows, 0] = 0.5 * (a_lps[rows, 0] + b_lps[rows, 0])
+            aux = torch.zeros((P + R, 1), dtype=used_lps.dtype)
+            aux[rows] = 1.0
+            teacher_logprobs = torch.cat([used_lps, aux], dim=1)
+            teacher_ids = torch.cat([used_ids, torch.zeros((P + R, 1), dtype=used_ids.dtype)], dim=1)
         la = float(a_lps[rows, 0].mean()) if R > 0 else 0.0
         lb = float(b_lps[rows, 0].mean()) if R > 0 else 0.0
         output.extra_fields["rr_mt_stats"] = {"mode": mode, "domain": "B" if is_b else "A", "lpA": la, "lpB": lb, "resp_len": R}
